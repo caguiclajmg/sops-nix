@@ -107,6 +107,7 @@ type options struct {
 	checkMode    CheckMode
 	manifest     string
 	ignorePasswd bool
+	useRamfs	 bool
 }
 
 type appContext struct {
@@ -308,8 +309,9 @@ func decryptSecrets(secrets []secret) error {
 }
 
 const RAMFS_MAGIC int32 = -2054924042
+const TMPFS_MAGIC int32 = 16914836
 
-func mountSecretFs(mountpoint string, keysGid int) error {
+func mountSecretFs(mountpoint string, useRamfs bool, keysGid int) error {
 	if err := os.MkdirAll(mountpoint, 0751); err != nil {
 		return fmt.Errorf("Cannot create directory '%s': %w", mountpoint, err)
 	}
@@ -318,8 +320,19 @@ func mountSecretFs(mountpoint string, keysGid int) error {
 	if err := unix.Statfs(mountpoint, &buf); err != nil {
 		return fmt.Errorf("Cannot get statfs for directory '%s': %w", mountpoint, err)
 	}
-	if int32(buf.Type) != RAMFS_MAGIC {
-		if err := unix.Mount("none", mountpoint, "ramfs", unix.MS_NODEV|unix.MS_NOSUID, "mode=0751"); err != nil {
+
+	var fstype string
+	var magic int32
+	if useRamfs { 
+		fstype = "ramfs"
+		magic = RAMFS_MAGIC
+	} else {			
+		fstype = "tmpfs" 
+		magic = TMPFS_MAGIC
+	}
+
+	if int32(buf.Type) != magic {
+		if err := unix.Mount("none", mountpoint, fstype, unix.MS_NODEV|unix.MS_NOSUID, "mode=0751"); err != nil {
 			return fmt.Errorf("Cannot mount: %s", err)
 		}
 	}
@@ -844,6 +857,7 @@ func parseFlags(args []string) (*options, error) {
 	var checkMode string
 	fs.StringVar(&checkMode, "check-mode", "off", `Validate configuration without installing it (possible values: "manifest","sopsfile","off")`)
 	fs.BoolVar(&opts.ignorePasswd, "ignore-passwd", false, `Don't look up anything in /etc/passwd. Causes everything to be owned by root:root`)
+	fs.BoolVar(&opts.useRamfs, "use-ramfs", true, `Use ramfs`)
 	if err := fs.Parse(args[1:]); err != nil {
 		return nil, err
 	}
@@ -901,7 +915,7 @@ func installSecrets(args []string) error {
 
 	isDry := os.Getenv("NIXOS_ACTION") == "dry-activate"
 
-	if err := mountSecretFs(manifest.SecretsMountPoint, keysGid); err != nil {
+	if err := mountSecretFs(manifest.SecretsMountPoint, opts.useRamfs, keysGid); err != nil {
 		return fmt.Errorf("Failed to mount filesystem for secrets: %w", err)
 	}
 
