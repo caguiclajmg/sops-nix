@@ -330,7 +330,7 @@ in {
       system.activationScripts = {
         setupSecretsForUsers = mkIf (secretsForUsers != {}) (stringAfter ([ "specialfs" ] ++ optional cfg.age.generateKey "generate-age-key") ''
           [ -e /run/current-system ] || echo setting up secrets for users...
-          ${withEnvironment "${sops-install-secrets}/bin/sops-install-secrets -ignore-passwd ${manifestForUsers} -use-ramfs ${toString cfg.useRamfs}"}
+          ${withEnvironment "${sops-install-secrets}/bin/sops-install-secrets -ignore-passwd ${manifestForUsers} -use-ramfs ${boolToString cfg.useRamfs}"}
         '' // lib.optionalAttrs (config.system ? dryActivationScript) {
           supportsDryActivation = true;
         });
@@ -341,7 +341,7 @@ in {
 
         setupSecrets = mkIf (regularSecrets != {}) (stringAfter ([ "specialfs" "users" "groups" ] ++ optional cfg.age.generateKey "generate-age-key") ''
           [ -e /run/current-system ] || echo setting up secrets...
-          ${withEnvironment "${sops-install-secrets}/bin/sops-install-secrets ${manifest} -use-ramfs ${toString cfg.useRamfs}"}
+          ${withEnvironment "${sops-install-secrets}/bin/sops-install-secrets ${manifest} -use-ramfs ${boolToString cfg.useRamfs}"}
         '' // lib.optionalAttrs (config.system ? dryActivationScript) {
           supportsDryActivation = true;
         });
