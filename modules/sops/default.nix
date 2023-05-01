@@ -41,7 +41,7 @@ let
         '';
       };
       format = mkOption {
-        type = types.enum ["yaml" "json" "binary"];
+        type = types.enum ["yaml" "json" "binary" "dotenv" "ini"];
         default = cfg.defaultSopsFormat;
         description = ''
           File format used to decrypt the sops secret.
@@ -126,6 +126,7 @@ let
       sshKeyPaths = cfg.gnupg.sshKeyPaths;
       ageKeyFile = cfg.age.keyFile;
       ageSshKeyPaths = cfg.age.sshKeyPaths;
+      userMode = false;
       logging = {
         keyImport = builtins.elem "keyImport" cfg.log;
         secretChanges = builtins.elem "secretChanges" cfg.log;
@@ -299,6 +300,7 @@ in {
     };
   };
   imports = [
+    ./templates
     (mkRenamedOptionModule [ "sops" "gnupgHome" ] [ "sops" "gnupg" "home" ])
     (mkRenamedOptionModule [ "sops" "sshKeyPaths" ] [ "sops" "gnupg" "sshKeyPaths" ])
   ];

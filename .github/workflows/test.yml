@@ -1,6 +1,11 @@
 name: "Test"
 on:
   pull_request:
+  push:
+    branches:
+      - master
+      - staging
+      - release-*
   schedule:
     - cron:  '51 2 * * *'
 jobs:
@@ -8,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
-    - uses: cachix/install-nix-action@v17
+    - uses: cachix/install-nix-action@v20
     - name: Add keys group (needed for go tests)
       run: sudo groupadd keys
     - name: Run unit tests

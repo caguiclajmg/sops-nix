@@ -1,5 +1,3 @@
-// +build linux
-
 package main
 
 import (
@@ -8,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/user"
 	"path"
@@ -23,7 +20,7 @@ import (
 
 	"github.com/mozilla-services/yaml"
 	"go.mozilla.org/sops/v3/decrypt"
-	"golang.org/x/sys/unix"
+	"github.com/joho/godotenv"
 )
 
 type secret struct {
@@ -57,6 +54,7 @@ type manifest struct {
 	GnupgHome         string        `json:"gnupgHome"`
 	AgeKeyFile        string        `json:"ageKeyFile"`
 	AgeSshKeyPaths    []string      `json:"ageSshKeyPaths"`
+	UserMode          bool          `json:"userMode"`
 	Logging           loggingConfig `json:"logging"`
 }
 
@@ -73,7 +71,22 @@ const (
 	Yaml   FormatType = "yaml"
 	Json   FormatType = "json"
 	Binary FormatType = "binary"
+	Dotenv FormatType = "dotenv"
+	Ini    FormatType = "ini"
 )
+
+func IsValidFormat(format string) bool {
+	switch format {
+	case string(Yaml),
+		 string(Json),
+		 string(Binary),
+		 string(Dotenv),
+		 string(Ini):
+		return true
+	default:
+		return false
+	}
+}
 
 func (f *FormatType) UnmarshalJSON(b []byte) error {
 	var s string
@@ -84,7 +97,7 @@ func (f *FormatType) UnmarshalJSON(b []byte) error {
 	switch t {
 	case "":
 		*f = Yaml
-	case Yaml, Json, Binary:
+	case Yaml, Json, Binary, Dotenv, Ini:
 		*f = t
 	}
 
@@ -117,28 +130,6 @@ type appContext struct {
 	ignorePasswd bool
 }
 
-func secureSymlinkChown(symlinkToCheck, expectedTarget string, owner, group int) error {
-	fd, err := unix.Open(symlinkToCheck, unix.O_CLOEXEC|unix.O_PATH|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("Failed to open %s: %w", symlinkToCheck, err)
-	}
-	defer unix.Close(fd)
-
-	buf := make([]byte, len(expectedTarget)+1) // oversize by one to detect trunc
-	n, err := unix.Readlinkat(fd, "", buf)
-	if err != nil {
-		return fmt.Errorf("couldn't readlinkat %s", symlinkToCheck)
-	}
-	if n > len(expectedTarget) || string(buf[:n]) != expectedTarget {
-		return fmt.Errorf("symlink %s does not point to %s", symlinkToCheck, expectedTarget)
-	}
-	err = unix.Fchownat(fd, "", owner, group, unix.AT_EMPTY_PATH)
-	if err != nil {
-		return fmt.Errorf("cannot change owner of '%s' to %d/%d: %w", symlinkToCheck, owner, group, err)
-	}
-	return nil
-}
-
 func readManifest(path string) (*manifest, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -164,15 +155,17 @@ func linksAreEqual(linkTarget, targetFile string, info os.FileInfo, secret *secr
 	return linkTarget == targetFile && validUG
 }
 
-func symlinkSecret(targetFile string, secret *secret) error {
+func symlinkSecret(targetFile string, secret *secret, userMode bool) error {
 	for {
 		stat, err := os.Lstat(secret.Path)
 		if os.IsNotExist(err) {
 			if err := os.Symlink(targetFile, secret.Path); err != nil {
 				return fmt.Errorf("Cannot create symlink '%s': %w", secret.Path, err)
 			}
-			if err := secureSymlinkChown(secret.Path, targetFile, secret.owner, secret.group); err != nil {
-				return fmt.Errorf("Cannot chown symlink '%s': %w", secret.Path, err)
+			if !userMode {
+				if err := SecureSymlinkChown(secret.Path, targetFile, secret.owner, secret.group); err != nil {
+					return fmt.Errorf("Cannot chown symlink '%s': %w", secret.Path, err)
+				}
 			}
 			return nil
 		} else if err != nil {
@@ -194,7 +187,7 @@ func symlinkSecret(targetFile string, secret *secret) error {
 	}
 }
 
-func symlinkSecrets(targetDir string, secrets []secret) error {
+func symlinkSecrets(targetDir string, secrets []secret, userMode bool) error {
 	for _, secret := range secrets {
 		targetFile := filepath.Join(targetDir, secret.Name)
 		if targetFile == secret.Path {
@@ -204,7 +197,7 @@ func symlinkSecrets(targetDir string, secrets []secret) error {
 		if err := os.MkdirAll(parent, os.ModePerm); err != nil {
 			return fmt.Errorf("Cannot create parent directory of '%s': %w", secret.Path, err)
 		}
-		if err := symlinkSecret(targetFile, &secret); err != nil {
+		if err := symlinkSecret(targetFile, &secret, userMode); err != nil {
 			return fmt.Errorf("Failed to symlink secret '%s': %w", secret.Path, err)
 		}
 	}
@@ -271,23 +264,26 @@ func decryptSecret(s *secret, sourceFiles map[string]plainData) error {
 		if err != nil {
 			return fmt.Errorf("Failed to decrypt '%s': %w", s.SopsFile, err)
 		}
-		if s.Format == Binary {
+
+		switch s.Format {
+		case Binary, Dotenv, Ini:
 			sourceFile.binary = plain
-		} else {
-			if s.Format == Yaml {
-				if err := yaml.Unmarshal(plain, &sourceFile.data); err != nil {
-					return fmt.Errorf("Cannot parse yaml of '%s': %w", s.SopsFile, err)
-				}
-			} else {
-				if err := json.Unmarshal(plain, &sourceFile.data); err != nil {
-					return fmt.Errorf("Cannot parse json of '%s': %w", s.SopsFile, err)
-				}
+		case Yaml:
+			if err := yaml.Unmarshal(plain, &sourceFile.data); err != nil {
+				return fmt.Errorf("Cannot parse yaml of '%s': %w", s.SopsFile, err)
 			}
+		case Json:
+			if err := json.Unmarshal(plain, &sourceFile.data); err != nil {
+				return fmt.Errorf("Cannot parse json of '%s': %w", s.SopsFile, err)
+			}
+		default:
+			return fmt.Errorf("Secret of type %s in %s is not supported", s.Format, s.SopsFile)
 		}
 	}
-	if s.Format == Binary {
+	switch s.Format {
+	case Binary, Dotenv, Ini:
 		s.value = sourceFile.binary
-	} else {
+	case Yaml, Json:
 		strVal, err := recurseSecretKey(sourceFile.data, s.Key)
 		if err != nil {
 			return fmt.Errorf("secret %s in %s is not valid: %w", s.Name, s.SopsFile, err)
@@ -311,40 +307,7 @@ func decryptSecrets(secrets []secret) error {
 const RAMFS_MAGIC int32 = -2054924042
 const TMPFS_MAGIC int32 = 16914836
 
-func mountSecretFs(mountpoint string, useRamfs bool, keysGid int) error {
-	if err := os.MkdirAll(mountpoint, 0751); err != nil {
-		return fmt.Errorf("Cannot create directory '%s': %w", mountpoint, err)
-	}
-
-	buf := unix.Statfs_t{}
-	if err := unix.Statfs(mountpoint, &buf); err != nil {
-		return fmt.Errorf("Cannot get statfs for directory '%s': %w", mountpoint, err)
-	}
-
-	var fstype string
-	var magic int32
-	if useRamfs { 
-		fstype = "ramfs"
-		magic = RAMFS_MAGIC
-	} else {			
-		fstype = "tmpfs" 
-		magic = TMPFS_MAGIC
-	}
-
-	if int32(buf.Type) != magic {
-		if err := unix.Mount("none", mountpoint, fstype, unix.MS_NODEV|unix.MS_NOSUID, "mode=0751"); err != nil {
-			return fmt.Errorf("Cannot mount: %s", err)
-		}
-	}
-
-	if err := os.Chown(mountpoint, 0, int(keysGid)); err != nil {
-		return fmt.Errorf("Cannot change owner/group of '%s' to 0/%d: %w", mountpoint, keysGid, err)
-	}
-
-	return nil
-}
-
-func prepareSecretsDir(secretMountpoint string, linkName string, keysGid int) (*string, error) {
+func prepareSecretsDir(secretMountpoint string, linkName string, keysGid int, userMode bool) (*string, error) {
 	var generation uint64
 	linkTarget, err := os.Readlink(linkName)
 	if err == nil {
@@ -368,13 +331,15 @@ func prepareSecretsDir(secretMountpoint string, linkName string, keysGid int) (*
 	if err := os.Mkdir(dir, os.FileMode(0751)); err != nil {
 		return nil, fmt.Errorf("mkdir(): %w", err)
 	}
-	if err := os.Chown(dir, 0, int(keysGid)); err != nil {
-		return nil, fmt.Errorf("Cannot change owner/group of '%s' to 0/%d: %w", dir, keysGid, err)
+	if !userMode {
+		if err := os.Chown(dir, 0, int(keysGid)); err != nil {
+			return nil, fmt.Errorf("Cannot change owner/group of '%s' to 0/%d: %w", dir, keysGid, err)
+		}
 	}
 	return &dir, nil
 }
 
-func writeSecrets(secretDir string, secrets []secret, keysGid int) error {
+func writeSecrets(secretDir string, secrets []secret, keysGid int, userMode bool) error {
 	for _, secret := range secrets {
 		fp := filepath.Join(secretDir, secret.Name)
 
@@ -385,23 +350,27 @@ func writeSecrets(secretDir string, secrets []secret, keysGid int) error {
 			if err := os.MkdirAll(pathSoFar, 0751); err != nil {
 				return fmt.Errorf("Cannot create directory '%s' for %s: %w", pathSoFar, fp, err)
 			}
-			if err := os.Chown(pathSoFar, 0, int(keysGid)); err != nil {
-				return fmt.Errorf("Cannot own directory '%s' for %s: %w", pathSoFar, fp, err)
+			if !userMode {
+				if err := os.Chown(pathSoFar, 0, int(keysGid)); err != nil {
+					return fmt.Errorf("Cannot own directory '%s' for %s: %w", pathSoFar, fp, err)
+				}
 			}
 		}
 
-		if err := ioutil.WriteFile(fp, []byte(secret.value), secret.mode); err != nil {
+		if err := os.WriteFile(fp, []byte(secret.value), secret.mode); err != nil {
 			return fmt.Errorf("Cannot write %s: %w", fp, err)
 		}
-		if err := os.Chown(fp, secret.owner, secret.group); err != nil {
-			return fmt.Errorf("Cannot change owner/group of '%s' to %d/%d: %w", fp, secret.owner, secret.group, err)
+		if !userMode {
+			if err := os.Chown(fp, secret.owner, secret.group); err != nil {
+				return fmt.Errorf("Cannot change owner/group of '%s' to %d/%d: %w", fp, secret.owner, secret.group, err)
+			}
 		}
 	}
 	return nil
 }
 
-func lookupKeysGroup() (int, error) {
-	group, err := user.LookupGroup("keys")
+func lookupGroup(groupname string) (int, error) {
+	group, err := user.LookupGroup(groupname)
 	if err != nil {
 		return 0, fmt.Errorf("Failed to lookup 'keys' group: %w", err)
 	}
@@ -412,30 +381,53 @@ func lookupKeysGroup() (int, error) {
 	return int(gid), nil
 }
 
+func lookupKeysGroup() (int, error) {
+  gid, err1 := lookupGroup("keys")
+  if err1 == nil {
+    return gid, nil
+  }
+  gid, err2 := lookupGroup("nogroup")
+  if err2 == nil {
+    return gid, nil
+  }
+  return 0, fmt.Errorf("Can't find group 'keys' nor 'nogroup' (%w).", err2)
+}
+
 func (app *appContext) loadSopsFile(s *secret) (*secretFile, error) {
 	if app.checkMode == Manifest {
 		return &secretFile{firstSecret: s}, nil
 	}
 
-	cipherText, err := ioutil.ReadFile(s.SopsFile)
+	cipherText, err := os.ReadFile(s.SopsFile)
 	if err != nil {
 		return nil, fmt.Errorf("Failed reading %s: %w", s.SopsFile, err)
 	}
 
 	var keys map[string]interface{}
-	if s.Format == Binary {
+
+	switch s.Format {
+	case Binary:
 		if err := json.Unmarshal(cipherText, &keys); err != nil {
 			return nil, fmt.Errorf("Cannot parse json of '%s': %w", s.SopsFile, err)
 		}
 		return &secretFile{cipherText: cipherText, firstSecret: s}, nil
-	}
-
-	if s.Format == Yaml {
+	case Yaml:
 		if err := yaml.Unmarshal(cipherText, &keys); err != nil {
 			return nil, fmt.Errorf("Cannot parse yaml of '%s': %w", s.SopsFile, err)
 		}
-	} else if err := json.Unmarshal(cipherText, &keys); err != nil {
-		return nil, fmt.Errorf("Cannot parse json of '%s': %w", s.SopsFile, err)
+	case Dotenv:
+		env, err := godotenv.Unmarshal(string(cipherText))
+		if err != nil {
+			return nil, fmt.Errorf("Cannot parse dotenv of '%s': %w", s.SopsFile, err)
+		}
+		keys = map[string]interface{}{}
+		for k, v := range env {
+			keys[k] = v
+		}
+	case Json:
+		if err := json.Unmarshal(cipherText, &keys); err != nil {
+			return nil, fmt.Errorf("Cannot parse json of '%s': %w", s.SopsFile, err)
+		}
 	}
 
 	return &secretFile{
@@ -452,7 +444,7 @@ func (app *appContext) validateSopsFile(s *secret, file *secretFile) error {
 			s.Name, s.SopsFile, s.Format,
 			file.firstSecret.Format, file.firstSecret.Name)
 	}
-	if app.checkMode != Manifest && s.Format != Binary {
+	if app.checkMode != Manifest && (!(s.Format == Binary || s.Format == Dotenv || s.Format == Ini )) {
 		_, err := recurseSecretKey(file.keys, s.Key)
 		if err != nil {
 			return fmt.Errorf("secret %s in %s is not valid: %w", s.Name, s.SopsFile, err)
@@ -471,7 +463,7 @@ func (app *appContext) validateSecret(secret *secret) error {
 	if app.ignorePasswd || os.Getenv("NIXOS_ACTION") == "dry-activate" {
 		secret.owner = 0
 		secret.group = 0
-	} else if app.checkMode == Off {
+	} else if app.checkMode == Off || app.ignorePasswd {
 		// we only access to the user/group during deployment
 		owner, err := user.Lookup(secret.Owner)
 		if err != nil {
@@ -498,7 +490,7 @@ func (app *appContext) validateSecret(secret *secret) error {
 		secret.Format = "yaml"
 	}
 
-	if secret.Format != "yaml" && secret.Format != "json" && secret.Format != "binary" {
+	if !IsValidFormat(string(secret.Format)) {
 		return fmt.Errorf("Unsupported format %s for secret %s", secret.Format, secret.Name)
 	}
 
@@ -545,7 +537,7 @@ func atomicSymlink(oldname, newname string) error {
 
 	// We need to use ioutil.TempDir, as we cannot overwrite a ioutil.TempFile,
 	// and removing+symlinking creates a TOCTOU race.
-	d, err := ioutil.TempDir(filepath.Dir(newname), "."+filepath.Base(newname))
+	d, err := os.MkdirTemp(filepath.Dir(newname), "."+filepath.Base(newname))
 	if err != nil {
 		return err
 	}
@@ -618,7 +610,7 @@ func importSSHKeys(logcfg loggingConfig, keyPaths []string, gpgHome string) erro
 		return fmt.Errorf("Cannot create %s: %w", secringPath, err)
 	}
 	for _, p := range keyPaths {
-		sshKey, err := ioutil.ReadFile(p)
+		sshKey, err := os.ReadFile(p)
 		if err != nil {
 			return fmt.Errorf("Cannot read ssh key '%s': %w", p, err)
 		}
@@ -642,7 +634,7 @@ func importSSHKeys(logcfg loggingConfig, keyPaths []string, gpgHome string) erro
 func importAgeSSHKeys(logcfg loggingConfig, keyPaths []string, ageFile os.File) error {
 	for _, p := range keyPaths {
 		// Read the key
-		sshKey, err := ioutil.ReadFile(p)
+		sshKey, err := os.ReadFile(p)
 		if err != nil {
 			return fmt.Errorf("Cannot read ssh key '%s': %w", p, err)
 		}
@@ -716,7 +708,7 @@ func handleModifications(isDry bool, logcfg loggingConfig, symlinkPath string, s
 		newPath := filepath.Join(secretDir, secret.Name)
 
 		// Read the old file
-		oldData, err := ioutil.ReadFile(oldPath)
+		oldData, err := os.ReadFile(oldPath)
 		if err != nil {
 			if os.IsNotExist(err) {
 				// File did not exist before
@@ -729,7 +721,7 @@ func handleModifications(isDry bool, logcfg loggingConfig, symlinkPath string, s
 		}
 
 		// Read the new file
-		newData, err := ioutil.ReadFile(newPath)
+		newData, err := os.ReadFile(newPath)
 		if err != nil {
 			return err
 		}
@@ -832,7 +824,7 @@ func (k *keyring) Remove() {
 }
 
 func setupGPGKeyring(logcfg loggingConfig, sshKeys []string, parentDir string) (*keyring, error) {
-	dir, err := ioutil.TempDir(parentDir, "gpg")
+	dir, err := os.MkdirTemp(parentDir, "gpg")
 	if err != nil {
 		return nil, fmt.Errorf("Cannot create gpg home in '%s': %s", parentDir, err)
 	}
@@ -856,7 +848,7 @@ func parseFlags(args []string) (*options, error) {
 	}
 	var checkMode string
 	fs.StringVar(&checkMode, "check-mode", "off", `Validate configuration without installing it (possible values: "manifest","sopsfile","off")`)
-	fs.BoolVar(&opts.ignorePasswd, "ignore-passwd", false, `Don't look up anything in /etc/passwd. Causes everything to be owned by root:root`)
+	fs.BoolVar(&opts.ignorePasswd, "ignore-passwd", false, `Don't look up anything in /etc/passwd. Causes everything to be owned by root:root or the user executing the tool in user mode`)
 	fs.BoolVar(&opts.useRamfs, "use-ramfs", true, `Use ramfs`)
 	if err := fs.Parse(args[1:]); err != nil {
 		return nil, err
@@ -877,6 +869,19 @@ func parseFlags(args []string) (*options, error) {
 	return &opts, nil
 }
 
+func replaceRuntimeDir(path, rundir string) (ret string) {
+	parts := strings.Split(path, "%%")
+	first := true
+	for _, part := range parts {
+		if !first {
+			ret += "%"
+		}
+		first = false
+		ret += strings.ReplaceAll(part, "%r", rundir)
+	}
+	return
+}
+
 func installSecrets(args []string) error {
 	opts, err := parseFlags(args)
 	if err != nil {
@@ -886,6 +891,21 @@ func installSecrets(args []string) error {
 	manifest, err := readManifest(opts.manifest)
 	if err != nil {
 		return err
+	}
+
+	if manifest.UserMode {
+    rundir, err := RuntimeDir()
+		if opts.checkMode == Off && err != nil {
+      return fmt.Errorf("Error: %v", err)
+		}
+		manifest.SecretsMountPoint = replaceRuntimeDir(manifest.SecretsMountPoint, rundir)
+		manifest.SymlinkPath = replaceRuntimeDir(manifest.SymlinkPath, rundir)
+		var newSecrets []secret
+		for _, secret := range manifest.Secrets {
+			secret.Path = replaceRuntimeDir(secret.Path, rundir)
+			newSecrets = append(newSecrets, secret)
+		}
+		manifest.Secrets = newSecrets
 	}
 
 	app := appContext{
@@ -915,7 +935,7 @@ func installSecrets(args []string) error {
 
 	isDry := os.Getenv("NIXOS_ACTION") == "dry-activate"
 
-	if err := mountSecretFs(manifest.SecretsMountPoint, opts.useRamfs, keysGid); err != nil {
+	if err := MountSecretFs(manifest.SecretsMountPoint, opts.useRamfs, keysGid, manifest.UserMode); err != nil {
 		return fmt.Errorf("Failed to mount filesystem for secrets: %w", err)
 	}
 
@@ -951,7 +971,7 @@ func installSecrets(args []string) error {
 		// Import the keyfile
 		if manifest.AgeKeyFile != "" {
 			// Read the keyfile
-			contents, err := ioutil.ReadFile(manifest.AgeKeyFile)
+			contents, err := os.ReadFile(manifest.AgeKeyFile)
 			if err != nil {
 				return fmt.Errorf("Cannot read keyfile '%s': %w", manifest.AgeKeyFile, err)
 			}
@@ -967,21 +987,23 @@ func installSecrets(args []string) error {
 		return err
 	}
 
-	secretDir, err := prepareSecretsDir(manifest.SecretsMountPoint, manifest.SymlinkPath, keysGid)
+	secretDir, err := prepareSecretsDir(manifest.SecretsMountPoint, manifest.SymlinkPath, keysGid, manifest.UserMode)
 	if err != nil {
 		return fmt.Errorf("Failed to prepare new secrets directory: %w", err)
 	}
-	if err := writeSecrets(*secretDir, manifest.Secrets, keysGid); err != nil {
+	if err := writeSecrets(*secretDir, manifest.Secrets, keysGid, manifest.UserMode); err != nil {
 		return fmt.Errorf("Cannot write secrets: %w", err)
 	}
-	if err := handleModifications(isDry, manifest.Logging, manifest.SymlinkPath, *secretDir, manifest.Secrets); err != nil {
-		return fmt.Errorf("Cannot request units to restart: %w", err)
+	if !manifest.UserMode {
+		if err := handleModifications(isDry, manifest.Logging, manifest.SymlinkPath, *secretDir, manifest.Secrets); err != nil {
+			return fmt.Errorf("Cannot request units to restart: %w", err)
+		}
 	}
 	// No need to perform the actual symlinking
 	if isDry {
 		return nil
 	}
-	if err := symlinkSecrets(manifest.SymlinkPath, manifest.Secrets); err != nil {
+	if err := symlinkSecrets(manifest.SymlinkPath, manifest.Secrets, manifest.UserMode); err != nil {
 		return fmt.Errorf("Failed to prepare symlinks to secret store: %w", err)
 	}
 	if err := atomicSymlink(*secretDir, manifest.SymlinkPath); err != nil {
